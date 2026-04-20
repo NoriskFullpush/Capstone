@@ -1,0 +1,33 @@
+with tab_chat:
+    st.subheader("Q-COST AI와 대화하기")
+    st.caption("예: 시나리오 분석 결과 해석해줘 / 모델 성능을 요약해줘")
+
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+
+    for msg in st.session_state["messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_input = st.chat_input("Q-COST, 품질비용, 분석 결과에 대해 무엇이든 물어보세요.")
+    if user_input:
+        st.session_state["messages"].append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            if not google_api_key:
+                st.warning("Google API KEY를 사이드바에 먼저 입력해 주세요.")
+            else:
+                analysis_summary = st.session_state.get("analysis_summary", "")
+                try:
+                    answer = generate_ai_response(
+                        user_input,
+                        api_key=google_api_key,
+                        analysis_summary=analysis_summary
+                    )
+                except Exception as e:
+                    answer = f"Gemini 호출 중 오류가 발생했습니다:\n\n{e}"
+
+                st.markdown(answer)
+                st.session_state["messages"].append({"role": "assistant", "content": answer})
