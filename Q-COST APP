@@ -1,0 +1,560 @@
+st.set_page_config(page_title="Q-COST AI", layout="wide")
+st.markdown("<h1 style='text-align: center;'>Q-COST AI</h1>", unsafe_allow_html=True)
+
+tab_analysis, tab_chat = st.tabs(["자동 Q-COST 분석", "Q-COST AI 대화"])
+
+if "analysis_summary" not in st.session_state:
+    st.session_state["analysis_summary"] = ""
+
+# -----------------------
+# 사이드바 UI (업로드 + 설정)
+# -----------------------
+with st.sidebar:
+    st.header("🔑 설정")
+    google_api_key = st.sidebar.text_input("Google API Key", type="password")
+
+    if google_api_key and google_api_key.strip():
+        st.sidebar.success("API 키가 설정되었습니다.", icon="✅")
+    else:
+        st.sidebar.info("Google API 키를 입력하세요.")
+
+
+    st.markdown("---")
+
+    st.header("📤 데이터 업로드")
+    uploaded_file = st.file_uploader(
+        "CSV 또는 Excel 파일",
+        type=["csv", "xlsx", "xls"]
+    )
+
+    st.caption("업로드 후, 분석 탭에서 **비용 컬럼 → 타깃 → 제외 컬럼** 순서로 설정하세요.")
+
+
+# =======================
+# 1) 분석 탭
+# =======================
+with tab_analysis:
+    st.subheader("✔ 데이터 확인")
+
+    if uploaded_file is None:
+        st.info("사이드바에서 CSV 또는 Excel 파일을 업로드하면 자동으로 분석을 시작합니다.")
+        st.stop()
+
+    # 파일 읽기
+    if uploaded_file.name.endswith(".csv"):
+        df = read_csv_auto(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+
+    st.write("#### 원본 데이터 미리보기")
+    st.dataframe(df.head(), use_container_width=True)
+
+    numeric_cols = list(df.select_dtypes(include=[np.number]).columns)
+    if len(numeric_cols) == 0:
+        st.warning("숫자형 컬럼이 없습니다. (회귀/시나리오 분석을 위해 숫자형 비용 컬럼이 필요합니다.)")
+        st.stop()
+
+    st.markdown("<div style='margin-top:40px'></div>", unsafe_allow_html=True)
+    # -------------------------
+    # Q-COST 컬럼 자동 탐지 + 직접 지정
+    # -------------------------
+    st.subheader("✔ Q-COST 컬럼 지정 (예방 · 평가 · 실패)")
+    auto_cost_cols = detect_cost_columns(df)
+    st.caption("자동으로 찾아본 결과를 기본값으로 넣어두었어요. 필요하면 아래에서 직접 바꿔주세요.")
+
+    all_columns = list(df.columns)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        prevention_selected = st.multiselect(
+            "예방비용(P)",
+            options=all_columns,
+            default=auto_cost_cols["prevention"],
+            help="예방 활동, 교육, 설비 개선 등에 쓰이는 비용 컬럼"
+        )
+
+    with c2:
+        appraisal_selected = st.multiselect(
+            "평가비용(A)",
+            options=all_columns,
+            default=auto_cost_cols["appraisal"],
+            help="검사, 시험, 품질점검에 들어가는 비용 컬럼"
+        )
+
+    with c3:
+        # 실패비용 기본값(원본 로직 유지): 내부+외부 실패 자동 추천
+        failure_default = auto_cost_cols["internal_failure"] + auto_cost_cols["external_failure"]
+
+        # 자동 탐지가 비어있으면 이름 기반 추천(원본 로직 유지)
+        if not failure_default:
+            for c in numeric_cols:
+                name = str(c).lower()
+                if any(k in name for k in ["실패", "불량", "failure", "defect"]):
+                    failure_default.append(c)
+
+        failure_selected_cols = st.multiselect(
+            "실패비용(F)",
+            options=list(numeric_cols),
+            default=failure_default,
+            help="실패비용 컬럼(여러 개 선택 가능)"
+        )
+
+    st.caption(
+        f"선택 현황 · 예방 {len(prevention_selected)}개 / 평가 {len(appraisal_selected)}개 / 실패 {len(failure_selected_cols)}개"
+    )
+
+    cost_cols = {
+        "prevention": prevention_selected,
+        "appraisal": appraisal_selected,
+        "internal_failure": failure_selected_cols,
+        "external_failure": [],
+    }
+
+    st.markdown("<div style='margin-top:40px'></div>", unsafe_allow_html=True)
+    # -------------------------
+    # 타깃 선택 (기존 컬럼 vs 자동 합산)
+    # -------------------------
+    st.subheader("✔ 타깃(Total Q-COST) 설정")
+    target_option = st.radio("종속변수(총 품질비용) 설정",
+                         ["기존 컬럼 선택", "자동 계산 (예방+평가+실패)"], horizontal=True)
+
+
+    numeric_df = df.select_dtypes(include=[np.number]).copy()
+
+    # 합산에 사용할 컬럼들(숫자형만)
+    p_cols = [c for c in prevention_selected if c in numeric_df.columns]
+    a_cols = [c for c in appraisal_selected if c in numeric_df.columns]
+    f_cols = [c for c in failure_selected_cols if c in numeric_df.columns]
+
+    target_col = None
+    total_q_cost_col = None
+
+    if target_option == "기존 컬럼 선택":
+        target_col = st.selectbox(
+            "총 품질비용(Total Q-COST) 컬럼 선택",
+            ["(선택)"] + list(numeric_df.columns),
+        )
+        if target_col == "(선택)":
+            target_col = None
+    else:
+        if p_cols or a_cols or f_cols:
+            temp_total_col = "TOTAL_Q_COST"
+            suffix = 1
+            while temp_total_col in df.columns:
+                temp_total_col = f"TOTAL_Q_COST_{suffix}"
+                suffix += 1
+
+            numeric_df[temp_total_col] = numeric_df[p_cols + a_cols + f_cols].sum(axis=1)
+            df[temp_total_col] = numeric_df[temp_total_col]
+            target_col = temp_total_col
+            total_q_cost_col = temp_total_col
+            st.success(f"'{temp_total_col}' 컬럼이 자동 생성되었습니다.")
+        else:
+            st.warning("자동 합산을 위해 예방/평가/실패비용 컬럼 중 최소 1개 이상을 선택해 주세요.")
+    
+    st.markdown("<div style='margin-top:40px'></div>", unsafe_allow_html=True)
+    # -------------------------
+    # 메인 모델(분석) 실행
+    # -------------------------
+    st.subheader("✔ 메인 모델 분석")
+
+    if target_col is None or target_col not in df.columns:
+        st.info("타깃 컬럼을 선택하면 메인 모델 학습이 진행됩니다.")
+    else:
+        main_candidate_cols = [c for c in numeric_df.columns if c != target_col]
+        main_exclude_cols = st.multiselect(
+            "메인 모델에서 독립변수에서 제외할 컬럼 선택",
+            options=main_candidate_cols,
+            help="실패율/불량률 등 타깃을 사실상 그대로 반영하는 지표는 제외하는 것을 권장합니다."
+        )
+
+        # 타깃 처리 (이진/연속 자동)
+        target_series = binarize_target(df[target_col])
+        unique_vals = target_series.dropna().unique()
+        is_binary = len(unique_vals) <= 2 and set(unique_vals).issubset({0, 1})
+
+        numeric_df[target_col] = target_series
+        data = numeric_df.dropna(subset=[target_col])
+
+        if data.shape[0] < 5:
+            st.warning("유효한 데이터 행이 5개 미만입니다. 더 많은 데이터가 있으면 좋습니다.")
+        else:
+            X = data.drop(columns=[target_col])
+            y = data[target_col]
+
+            if main_exclude_cols:
+                X = X.drop(columns=[c for c in main_exclude_cols if c in X.columns], errors="ignore")
+
+            # (기존 로직 유지) 필요시 실패비용 관련 컬럼 제거하여 leakage 방지
+            failure_related_cols = list(failure_selected_cols)
+            remove_failure_features = True
+            if total_q_cost_col is not None and target_col == total_q_cost_col:
+                remove_failure_features = False
+            if remove_failure_features and failure_related_cols:
+                X = remove_failure_related_features(X, failure_related_cols)
+
+            st.write("### 모델 학습 결과")
+
+            if is_binary:
+                st.write("#### (분류) 성공/실패 또는 양품/불량 예측")
+
+                clf_results, (X_train, X_test, y_train, y_test) = train_models_classification(X, y)
+
+                best_overall_name = max(clf_results.keys(), key=lambda m: clf_results[m]["auc"])
+                best_overall_model = clf_results[best_overall_name]["model"]
+
+                tree_candidates = [name for name, res in clf_results.items() if is_tree_model(res["model"])]
+
+                shap_model_name = None
+                if is_tree_model(best_overall_model):
+                    shap_model_name = best_overall_name
+                elif tree_candidates:
+                    shap_model_name = max(tree_candidates, key=lambda m: clf_results[m]["auc"])
+
+                if shap_model_name is not None:
+                    shap_model = clf_results[shap_model_name]["model"]
+                    if shap_model_name == best_overall_name:
+                        title = f"#### SHAP 변수 중요도 (최고 성능 모델: {shap_model_name})"
+                    else:
+                        title = (
+                            "#### SHAP 변수 중요도 "
+                            f"(Tree 모델 기준: {shap_model_name}, "
+                            f"전체 최고 모델(AUC): {best_overall_name})"
+                        )
+                    st.write(title)
+
+                    shap_df_best = get_shap_importance_df(shap_model, X_train, X.columns)
+                    render_shap_table(shap_df_best)
+                else:
+                    st.info("트리 기반 모델이 없어 SHAP 변수 중요도를 계산하지 않습니다. 대신 성능 지표만 참고해주세요.")
+
+                summary_lines = ["[분류 모델 요약]"]
+                for name, r in clf_results.items():
+                    summary_lines.append(
+                        f"- {name}: Accuracy={r['accuracy']:.3f}, F1={r['f1']:.3f}, AUC={r['auc']:.3f}"
+                    )
+                summary_lines.append(f"- 전체 최고 성능 모델(AUC 기준): {best_overall_name}")
+                if shap_model_name is not None and shap_model_name != best_overall_name:
+                    summary_lines.append(f"- SHAP 변수 중요도는 트리 기반 모델 '{shap_model_name}' 기준으로 산출")
+                summary_lines.append(f"- 사용된 특징 수: {X.shape[1]}")
+                summary_lines.append(f"- 타깃 컬럼: {target_col}")
+                st.session_state["analysis_summary"] = "\n".join(summary_lines)
+
+            else:
+                st.write("#### (회귀) Total Q-COST 예측")
+
+                reg_results, (X_train, X_test, y_train, y_test) = train_models_regression(X, y)
+
+                # ✅ UI 수정 금지
+                st.write("#### 단일 변수별 R² 점수")
+                feature_r2_df = compute_feature_r2(X, y)
+                render_feature_r2_table(feature_r2_df)
+
+                best_overall_name = max(reg_results.keys(), key=lambda m: reg_results[m]["r2"])
+                best_overall_model = reg_results[best_overall_name]["model"]
+
+                tree_candidates = [name for name, res in reg_results.items() if is_tree_model(res["model"])]
+
+                shap_model_name = None
+                if is_tree_model(best_overall_model):
+                    shap_model_name = best_overall_name
+                elif tree_candidates:
+                    shap_model_name = max(tree_candidates, key=lambda m: reg_results[m]["r2"])
+
+                if shap_model_name is not None:
+                    shap_model = reg_results[shap_model_name]["model"]
+                    if shap_model_name == best_overall_name:
+                        title = f"#### SHAP 변수 중요도 (최고 성능 모델: {shap_model_name})"
+                    else:
+                        title = (
+                            "#### SHAP 변수 중요도 "
+                            f"(Tree 모델 기준: {shap_model_name}, "
+                            f"전체 최고 모델(R²): {best_overall_name})"
+                        )
+                    st.write(title)
+
+                    shap_df_best = get_shap_importance_df(shap_model, X_train, X.columns)
+                    render_shap_table(shap_df_best)
+                else:
+                    st.info("트리 기반 회귀 모델이 없어 SHAP 변수 중요도를 계산하지 않습니다. 대신 R², RMSE 지표를 참고해주세요.")
+
+                summary_lines = ["[회귀 모델 요약]"]
+                for name, r in reg_results.items():
+                    summary_lines.append(f"- {name}: RMSE={r['rmse']:.3f}, R²={r['r2']:.3f}")
+                summary_lines.append(f"- 전체 최고 성능 모델(R² 기준): {best_overall_name}")
+                if shap_model_name is not None and shap_model_name != best_overall_name:
+                    summary_lines.append(f"- SHAP 변수 중요도는 트리 기반 모델 '{shap_model_name}' 기준으로 산출")
+                summary_lines.append(f"- 사용된 특징 수: {X.shape[1]}")
+                summary_lines.append(f"- 타깃 컬럼: {target_col}")
+                st.session_state["analysis_summary"] = "\n".join(summary_lines)
+
+    # -------------------------
+    # 참고: 과거 최소 비용구조
+    # -------------------------
+    show_min_q_cost_ratio(df, cost_cols, total_q_cost_col=total_q_cost_col)
+
+    st.markdown("<div style='margin-top:40px'></div>", unsafe_allow_html=True)
+
+    # -------------------------
+    # 시나리오 (로직 절대 변경 금지: 출력 UI만 변경)
+    # -------------------------
+    st.markdown("---")
+    st.subheader("🔎 예방/평가비용 변화 시나리오 (실패비용/총비용 변화 확인)")
+
+    # 시나리오 회귀에서 독립변수에서 제외할 컬럼 선택
+    scenario_candidate_cols = list(df.select_dtypes(include=[np.number]).columns)
+
+    scenario_exclude_cols = st.multiselect(
+        "시나리오 모델에서 독립변수에서 제외할 컬럼 선택 (실패율/불량률 등)",
+        options=scenario_candidate_cols,
+        help="실패비용과 너무 직접적으로 연결된 지표를 제외하면 시나리오 모델 해석력이 높아집니다."
+    )
+
+    # (기존 로직 그대로) failure_target_col 결정: 선택된 실패비용 컬럼들을 활용
+    failure_target_col = None
+    # 1) 실패비용 컬럼이 1개면 그 컬럼을 사용
+    if len(failure_selected_cols) == 1 and failure_selected_cols[0] in numeric_cols:
+        failure_target_col = failure_selected_cols[0]
+    # 2) 여러 개면 None으로 두고 build_scenario_result 내부 합산 사용
+    else:
+        failure_target_col = None
+
+    scenario_info, err = build_scenario_result(
+        df,
+        cost_cols,
+        failure_col_name=failure_target_col,
+        exclude_cols=scenario_exclude_cols
+    )
+
+    if err:
+        st.warning(err)
+    else:
+        base = float(scenario_info["baseline_cost"])
+        task_type = scenario_info.get("task_type", "regression")
+
+        def get_min_observed_shares(_df, prevention_cols, appraisal_cols, _failure_target_col):
+            df_num = _df.select_dtypes(include=[np.number]).copy()
+            p_cols2 = [c for c in prevention_cols if c in df_num.columns]
+            a_cols2 = [c for c in appraisal_cols if c in df_num.columns]
+
+            # 실패비용은: 단일 컬럼이면 그 컬럼, 아니면 선택된 실패비용 컬럼 합산
+            if _failure_target_col and _failure_target_col in df_num.columns:
+                f_cols2 = [_failure_target_col]
+            else:
+                f_cols2 = [c for c in failure_selected_cols if c in df_num.columns]
+
+            p = df_num[p_cols2].sum(axis=1) if p_cols2 else pd.Series(0.0, index=df_num.index)
+            a = df_num[a_cols2].sum(axis=1) if a_cols2 else pd.Series(0.0, index=df_num.index)
+            f = df_num[f_cols2].sum(axis=1) if f_cols2 else pd.Series(0.0, index=df_num.index)
+
+            tot = p + a + f
+            mask = tot > 0
+            if mask.sum() == 0:
+                return None
+
+            idx = tot[mask].idxmin()
+            tot_min = float(tot.loc[idx])
+            return {
+                "p_share": float(p.loc[idx]) / tot_min * 100.0,
+                "a_share": float(a.loc[idx]) / tot_min * 100.0,
+                "f_share": float(f.loc[idx]) / tot_min * 100.0,
+            }
+
+        if task_type == "classification":
+            colA, colB = st.columns(2)
+            with colA:
+                prevent_pct = st.slider("예방비용 증가율 (%)", -50, 200, 0, step=1)
+            with colB:
+                appraisal_pct = st.slider("평가/검사비용 증가율 (%)", -50, 200, 0, step=1)
+
+            new_cost = scenario_info["predict_func"](prevent_pct / 100.0, appraisal_pct / 100.0)
+
+            base_prob = base
+            new_prob = float(new_cost)
+            prob_diff = (new_prob - base_prob) * 100  # %p
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("기준 실패 발생 확률", f"{base_prob:.3f}")
+            c2.metric("현재 실패 발생 확률", f"{new_prob:.3f}")
+            c3.metric("변화", f"{prob_diff:+.2f}%p")
+
+        else:
+            # ====== (기존 회귀 시나리오 로직 그대로) ======
+            base_prev = float(scenario_info.get("baseline_prevention", 0.0))
+            base_appr = float(scenario_info.get("baseline_appraisal", 0.0))
+            base_fail = float(base)
+
+            base_total_q = base_prev + base_appr + base_fail
+            if base_total_q <= 0:
+                st.warning("기준 총 품질비용(예방+평가+실패)이 0 이하라 시나리오 계산이 어렵습니다.")
+            else:
+                obs = get_min_observed_shares(
+                    df,
+                    scenario_info.get("prevention_cols", []),
+                    scenario_info.get("appraisal_cols", []),
+                    failure_target_col
+                )
+                if obs is None:
+                    obs_p = (base_prev / base_total_q * 100.0) if base_total_q > 0 else 10.0
+                    obs_a = (base_appr / base_total_q * 100.0) if base_total_q > 0 else 10.0
+                else:
+                    obs_p, obs_a = obs["p_share"], obs["a_share"]
+
+                def clamp(x, lo, hi):
+                    return max(lo, min(hi, x))
+
+                P_FACTOR_MIN, P_FACTOR_MAX = -0.50, 2.00
+                A_FACTOR_MIN, A_FACTOR_MAX = -0.50, 2.00
+
+                def predict_from_shares(p_share, a_share):
+                    if p_share + a_share >= 100.0:
+                        return None
+
+                    p_new_raw = base_total_q * (p_share / 100.0)
+                    a_new_raw = base_total_q * (a_share / 100.0)
+
+                    p_factor = (p_new_raw / base_prev - 1.0) if base_prev > 0 else 0.0
+                    a_factor = (a_new_raw / base_appr - 1.0) if base_appr > 0 else 0.0
+                    p_factor = clamp(p_factor, P_FACTOR_MIN, P_FACTOR_MAX)
+                    a_factor = clamp(a_factor, A_FACTOR_MIN, A_FACTOR_MAX)
+
+                    p_new = base_prev * (1.0 + p_factor)
+                    a_new = base_appr * (1.0 + a_factor)
+
+                    fail_pred = float(scenario_info["predict_func"](p_factor, a_factor))
+                    total_pred = float(p_new + a_new + fail_pred)
+
+                    if total_pred <= 0:
+                        return None
+
+                    fail_share_pred = fail_pred / total_pred * 100.0
+                    return fail_pred, total_pred, fail_share_pred
+
+                BAND_P = 20.0
+                BAND_A = 20.0
+                step = 1.0
+
+                p_min = max(0.0, obs_p - BAND_P)
+                p_max = min(95.0, obs_p + BAND_P)
+                a_min_base = max(0.0, obs_a - BAND_A)
+                a_max_base = min(95.0, obs_a + BAND_A)
+
+                LAMBDA = 0.02
+
+                best_score = float("inf")
+                best_p_share = None
+                best_a_share = None
+
+                p = p_min
+                while p <= p_max + 1e-9:
+                    a_max = min(a_max_base, 99.0 - p)
+                    a = a_min_base
+                    while a <= a_max + 1e-9:
+                        out = predict_from_shares(p, a)
+                        if out is not None:
+                            _, total_pred, _ = out
+                            reg = LAMBDA * ((p - obs_p) ** 2 + (a - obs_a) ** 2)
+                            score = total_pred + reg
+                            if score < best_score:
+                                best_score = score
+                                best_p_share = float(p)
+                                best_a_share = float(a)
+                        a += step
+                    p += step
+
+                if best_p_share is None:
+                    st.warning("최적 비율 탐색에 실패했습니다. 데이터/컬럼 선택을 확인해 주세요.")
+                else:
+                    st.markdown(
+                        f"💡 **(예측 기반) 총 품질비용이 최소가 되는 비율(총=100%)**: "
+                        f"예방 **{best_p_share:.0f}%**, 평가 **{best_a_share:.0f}%**"
+                    )
+
+                    
+                    if "scenario_p_share" not in st.session_state:
+                        st.session_state["scenario_p_share"] = float(best_p_share)
+                    if "scenario_a_share" not in st.session_state:
+                        st.session_state["scenario_a_share"] = float(best_a_share)
+
+                    colA, colB = st.columns(2)
+
+                    with colA:
+                        p_share = st.slider(
+                            "예방비용 비율",
+                            0.0, 95.0,
+                            step=1.0,
+                            key="scenario_p_share"
+                        )
+
+                    remaining = max(1.0, 99.0 - float(p_share))
+                    if float(st.session_state.get("scenario_a_share", 0.0)) > remaining:
+                        st.session_state["scenario_a_share"] = remaining
+
+                    with colB:
+                        a_share = st.slider(
+                            "평가비용 비율",
+                            0.0, remaining,
+                            step=1.0,
+                            key="scenario_a_share"  
+                        )
+                        
+
+                    out = predict_from_shares(p_share, a_share)
+                    f_share_input = 100.0 - float(p_share) - float(a_share)  # ✅ 총=100 구성 잔여 실패비율
+                    st.caption(f"총=100 구성 · 예방 {p_share:.0f}% / 평가 {a_share:.0f}% / 실패 {f_share_input:.0f}%")
+
+                    if out is None:
+                        st.warning("현재 비율 조합은 계산할 수 없습니다. (p+a가 100%에 너무 가까움/비현실 구간)")
+                    else:
+                        new_fail, new_total, new_fail_share = out
+
+                        fail_change_pct = (new_fail / base_fail - 1.0) * 100.0 if base_fail != 0 else 0.0
+                        total_change_pct = (new_total / base_total_q - 1.0) * 100.0 if base_total_q != 0 else 0.0
+
+                        base_fail_share = (base_fail / base_total_q) * 100.0 if base_total_q != 0 else 0.0
+                        fail_share_delta = float(new_fail_share) - float(base_fail_share)  # 퍼센트포인트 변화(pp)
+
+                        #st.metric로 직관 표시
+                        def arrow(v: float) -> str:
+                            if v > 0:
+                                return "📈"
+                            elif v < 0:
+                                return "📉"
+                            return "⏺️"
+
+                        m1, m2, m3= st.columns(3)
+
+                        m1.metric(
+                            label=f"{arrow(fail_change_pct)} 실패비용 변화",
+                            value=f"{fail_change_pct:+.1f}%",
+                            delta=float(fail_change_pct),
+                            delta_color="inverse"
+                        )
+
+                        m2.metric(
+                            label=f"{arrow(total_change_pct)} 전체 품질비용 변화",
+                            value=f"{total_change_pct:+.1f}%",
+                            delta=float(total_change_pct),
+                            delta_color="inverse"
+                        )
+
+                        # ✅ 총=100 구성 기준 실패비율(잔여) — 항상 합계 100이 되게 보이는 값
+                        m3.metric(
+                            label="🧩 잔여 실패비용 비율",
+                            value=f"{f_share_input:.1f}%"
+                        )
+
+                        st.markdown(
+                            """
+                            <small style="color: #AAAAAA;">
+                            ※ <b>안내</b><br>
+                            ‘실패비용 변화(%)’와 ‘전체 품질비용 변화(%)’는 과거 데이터 평균을 기준으로 한 변화율입니다.<br>
+                            ‘잔여 실패비용 비율’은 입력한 비용 구성 비율입니다.<br>
+                            본 ‘최적 비율’은 비현실 구간(p+a가 100%에 매우 근접) 및
+                            데이터 외삽 위험 구간을 제외한 범위 내에서 탐색된 최소값입니다.
+                            </small>
+                            """,
+                            unsafe_allow_html=True
+                        )
