@@ -1,0 +1,789 @@
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from xgboost import XGBClassifier, XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score,
+    mean_squared_error, r2_score
+)
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
+import shap
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+
+try:
+    from catboost import CatBoostClassifier, CatBoostRegressor
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
+
+
+# -----------------------
+# 유틸 함수들
+# -----------------------
+def is_tree_model(model):
+    """
+    RandomForest / XGBoost / LightGBM / CatBoost 같은 트리 기반 모델인지 확인
+    """
+    tree_types = (RandomForestClassifier, RandomForestRegressor)
+
+    # XGBoost
+    try:
+        import xgboost as xgb
+        tree_types = tree_types + (xgb.XGBClassifier, xgb.XGBRegressor)
+    except Exception:
+        pass
+
+    # LightGBM
+    try:
+        import lightgbm as lgb
+        tree_types = tree_types + (lgb.LGBMClassifier, lgb.LGBMRegressor)
+    except Exception:
+        pass
+
+    # CatBoost
+    try:
+        from catboost import CatBoostClassifier, CatBoostRegressor
+        tree_types = tree_types + (CatBoostClassifier, CatBoostRegressor)
+    except Exception:
+        pass
+
+    return isinstance(model, tree_types)
+
+
+def read_csv_auto(file_obj):
+    """
+    업로드된 CSV 파일을 인코딩을 바꿔 가며 읽는 함수.
+    UTF-8이 안 되면 cp949, 그래도 안 되면 ISO-8859-1 시도.
+    """
+    # 1) UTF-8 먼저 시도
+    try:
+        file_obj.seek(0)
+        return pd.read_csv(file_obj, encoding="utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # 2) cp949 (한글 윈도우 기본)
+    try:
+        file_obj.seek(0)
+        return pd.read_csv(file_obj, encoding="cp949")
+    except UnicodeDecodeError:
+        pass
+
+    # 3) 마지막으로 ISO-8859-1 같은 범용 인코딩
+    file_obj.seek(0)
+    return pd.read_csv(file_obj, encoding="iso-8859-1", errors="replace")
+
+
+def detect_cost_columns(df):
+    """
+    Q-COST 관련 컬럼 자동 탐지 (추천용)
+    - 예방비용(prevention)
+    - 평가/검사비용(appraisal)
+    - 내부 실패(internal failure)
+    - 외부 실패(external failure)
+    """
+    cols = df.columns
+
+    def match_keywords(keywords):
+        return [c for c in cols if any(k.lower() in str(c).lower() for k in keywords)]
+
+    prevention_cols = match_keywords(["예방", "prevention", "prevention_cost", "prevention cost", "P-COST", "P_COST"])
+    appraisal_cols = match_keywords(["평가", "검사", "inspection", "appraisal", "A-COST", "A_COST"])
+    internal_failure_cols = match_keywords(["내부", "internal_failure", "internal failure", "IF-COST", "IF_COST"])
+    external_failure_cols = match_keywords(["외부", "external_failure", "external failure", "EF-COST", "EF_COST"])
+
+    return {
+        "prevention": prevention_cols,
+        "appraisal": appraisal_cols,
+        "internal_failure": internal_failure_cols,
+        "external_failure": external_failure_cols,
+    }
+
+
+def detect_target_column(df):
+    """
+    성공/실패, 양품/불량 등 타깃 컬럼 자동 탐지
+    - 값이 2~3개 정도인 컬럼 + 이름 패턴 기반
+    """
+    candidates = []
+    for col in df.columns:
+        unique_vals = df[col].dropna().unique()
+        if 1 < len(unique_vals) <= 3:
+            candidates.append(col)
+
+    preferred_patterns = [
+        "성공", "실패", "합격", "불합격", "불량", "양품",
+        "pass_fail", "passfail", "pass", "fail",
+        "target", "label", "y"
+    ]
+    for col in candidates:
+        name = str(col).lower()
+        if any(p.lower() in name for p in preferred_patterns):
+            return col
+
+    return candidates[0] if candidates else None
+
+
+def binarize_target(series):
+    """
+    성공/실패 텍스트를 0/1로 맵핑
+    """
+    s = series.copy()
+    mapping = {
+        "성공": 1, "success": 1, "pass": 1, "합격": 1,
+        "실패": 0, "fail": 0, "불합격": 0, "불량": 0, "양품": 1
+    }
+
+    def _map(v):
+        if pd.isna(v):
+            return np.nan
+        v_str = str(v).strip().lower()
+        if v_str in mapping:
+            return mapping[v_str]
+        try:
+            return float(v)
+        except Exception:
+            return np.nan
+
+    s = s.map(_map)
+
+    unique_vals = [u for u in s.dropna().unique()]
+    if set(unique_vals).issubset({0, 1}):
+        return s
+
+    if len(unique_vals) == 2:
+        lo, hi = sorted(unique_vals)
+        return s.map(lambda x: 0 if x == lo else (1 if x == hi else np.nan))
+
+    return s
+
+
+def train_models_classification(X, y):
+    results = {}
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # 1) 로지스틱 회귀
+    logreg = LogisticRegression(max_iter=500)
+    logreg.fit(X_train, y_train)
+    y_pred = logreg.predict(X_test)
+    y_prob = logreg.predict_proba(X_test)[:, 1]
+
+    results["Logistic Regression"] = {
+        "model": logreg,
+        "accuracy": accuracy_score(y_test, y_pred),
+        "f1": f1_score(y_test, y_pred),
+        "auc": roc_auc_score(y_test, y_prob),
+    }
+
+    # 2) 랜덤포레스트
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_leaf=3,
+        random_state=42,
+        n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+    y_pred = rf.predict(X_test)
+    y_prob = rf.predict_proba(X_test)[:, 1]
+
+    results["RandomForest"] = {
+        "model": rf,
+        "accuracy": accuracy_score(y_test, y_pred),
+        "f1": f1_score(y_test, y_pred),
+        "auc": roc_auc_score(y_test, y_prob),
+    }
+
+    # 3) XGBoost (있으면)
+    if XGBOOST_AVAILABLE:
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.1,
+            min_child_weight=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="logloss",
+            random_state=42,
+            n_jobs=-1,
+        )
+
+        xgb_model.fit(X_train, y_train)
+        y_pred = xgb_model.predict(X_test)
+        y_prob = xgb_model.predict_proba(X_test)[:, 1]
+
+        results["XGBoost"] = {
+            "model": xgb_model,
+            "accuracy": accuracy_score(y_test, y_pred),
+            "f1": f1_score(y_test, y_pred),
+            "auc": roc_auc_score(y_test, y_prob),
+        }
+
+        if LIGHTGBM_AVAILABLE:
+            try:
+                lgb_model = lgb.LGBMClassifier(
+                    n_estimators=200,
+                    num_leaves=20,
+                    max_depth=3,
+                    min_child_samples=20,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    n_jobs=-1,
+                )
+                lgb_model.fit(X_train, y_train)
+                y_pred = lgb_model.predict(X_test)
+                y_prob = lgb_model.predict_proba(X_test)[:, 1]
+
+                results["LightGBM"] = {
+                    "model": lgb_model,
+                    "accuracy": accuracy_score(y_test, y_pred),
+                    "f1": f1_score(y_test, y_pred),
+                    "auc": roc_auc_score(y_test, y_prob),
+                }
+
+            except Exception as e:
+                msg = str(e)
+                if "special JSON characters in feature name" in msg or "feature name" in msg:
+                    st.info(
+                        "LightGBM에서 피처 이름(문자열) 관련 오류가 발생하여 "
+                        "LightGBM 모델은 제외하고 나머지 모델만 사용합니다."
+                    )
+                else:
+                    raise
+
+    if CATBOOST_AVAILABLE:
+        cb_model = CatBoostClassifier(
+            depth=5,
+            learning_rate=0.05,
+            iterations=500,
+            l2_leaf_reg=3,
+            random_state=42,
+            verbose=False,
+        )
+        cb_model.fit(X_train, y_train)
+        y_pred = cb_model.predict(X_test)
+        y_prob = cb_model.predict_proba(X_test)[:, 1]
+
+        results["CatBoost"] = {
+            "model": cb_model,
+            "accuracy": accuracy_score(y_test, y_pred),
+            "f1": f1_score(y_test, y_pred),
+            "auc": roc_auc_score(y_test, y_prob),
+        }
+
+    return results, (X_train, X_test, y_train, y_test)
+
+
+def train_models_regression(X, y):
+    """
+    회귀 모델 학습 (squared=False 안 쓰고, RMSE 직접 계산)
+    """
+    results = {}
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    # 1) 선형 회귀
+    lr = LinearRegression()
+    lr.fit(X_train, y_train)
+    y_pred = lr.predict(X_test)
+
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+
+    results["Linear Regression"] = {
+        "model": lr,
+        "rmse": rmse,
+        "r2": r2_score(y_test, y_pred),
+    }
+
+    # 2) 랜덤포레스트
+    rf = RandomForestRegressor(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_leaf=3,
+        random_state=42,
+        n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+    y_pred = rf.predict(X_test)
+
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+
+    results["RandomForest"] = {
+        "model": rf,
+        "rmse": rmse,
+        "r2": r2_score(y_test, y_pred),
+    }
+
+    # 3) XGBoost (있으면)
+    if XGBOOST_AVAILABLE:
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.1,
+            min_child_weight=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            n_jobs=-1,
+        )
+        xgb_model.fit(X_train, y_train)
+        y_pred = xgb_model.predict(X_test)
+
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+
+        results["XGBoost"] = {
+            "model": xgb_model,
+            "rmse": rmse,
+            "r2": r2_score(y_test, y_pred),
+        }
+
+    if LIGHTGBM_AVAILABLE:
+        try:
+            lgb_model = lgb.LGBMRegressor(
+                n_estimators=200,
+                num_leaves=20,
+                max_depth=3,
+                min_child_samples=20,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                n_jobs=-1,
+            )
+            lgb_model.fit(X_train, y_train)
+            y_pred = lgb_model.predict(X_test)
+
+            mse = mean_squared_error(y_test, y_pred)
+            rmse = np.sqrt(mse)
+
+            results["LightGBM"] = {
+                "model": lgb_model,
+                "rmse": rmse,
+                "r2": r2_score(y_test, y_pred),
+            }
+
+        except Exception as e:
+            msg = str(e)
+            if "special JSON characters in feature name" in msg or "feature name" in msg:
+                st.info(
+                    "LightGBM에서 피처 이름(문자열) 관련 오류가 발생하여 "
+                    "LightGBM 회귀 모델은 제외하고 나머지 모델만 사용합니다."
+                )
+            else:
+                raise
+
+    if CATBOOST_AVAILABLE:
+        cb_model = CatBoostRegressor(
+            depth=5,
+            learning_rate=0.05,
+            iterations=500,
+            l2_leaf_reg=3,
+            random_state=42,
+            verbose=False,
+        )
+        cb_model.fit(X_train, y_train)
+        y_pred = cb_model.predict(X_test)
+
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+
+        results["CatBoost"] = {
+            "model": cb_model,
+            "rmse": rmse,
+            "r2": r2_score(y_test, y_pred),
+        }
+
+    return results, (X_train, X_test, y_train, y_test)
+
+
+def remove_failure_related_features(X, failure_cols):
+    """
+    실패비용 관련 컬럼(내부/외부/통합)을 X(입력 특징)에서 제거하여
+    모델 누출(leakage)을 방지한다.
+    """
+    failure_cols = [c for c in failure_cols if c in X.columns]
+    return X.drop(columns=failure_cols, errors="ignore")
+
+
+def show_min_q_cost_ratio(df, cost_cols, total_q_cost_col=None):
+    """
+    데이터 내에서 '전체 Q-COST'가 가장 낮았던 관측치 기준으로
+    예방/평가/실패비용 비율을 계산하여 한 문장으로 출력한다.
+    """
+    numeric_df = df.select_dtypes(include=[np.number]).copy()
+    if numeric_df.shape[0] == 0:
+        return
+
+    prevention_cols = [c for c in cost_cols.get("prevention", []) if c in numeric_df.columns]
+    appraisal_cols = [c for c in cost_cols.get("appraisal", []) if c in numeric_df.columns]
+    internal_failure_cols = [c for c in cost_cols.get("internal_failure", []) if c in numeric_df.columns]
+    external_failure_cols = [c for c in cost_cols.get("external_failure", []) if c in numeric_df.columns]
+
+    failure_cols = [c for c in (internal_failure_cols + external_failure_cols) if c in numeric_df.columns]
+
+    if not (prevention_cols or appraisal_cols or failure_cols):
+        return
+
+    p = numeric_df[prevention_cols].sum(axis=1) if prevention_cols else pd.Series(0.0, index=numeric_df.index)
+    a = numeric_df[appraisal_cols].sum(axis=1) if appraisal_cols else pd.Series(0.0, index=numeric_df.index)
+    f = numeric_df[failure_cols].sum(axis=1) if failure_cols else pd.Series(0.0, index=numeric_df.index)
+
+    if total_q_cost_col is not None and total_q_cost_col in numeric_df.columns:
+        total_q = numeric_df[total_q_cost_col]
+    else:
+        total_q = p + a + f
+
+    mask = total_q > 0
+    if mask.sum() == 0:
+        return
+
+    total_q = total_q[mask]
+    p = p[mask]
+    a = a[mask]
+    f = f[mask]
+
+    idx_min = total_q.idxmin()
+    total_min = float(total_q.loc[idx_min])
+    if total_min <= 0:
+        return
+
+    p_ratio = float(p.loc[idx_min]) / total_min * 100
+    a_ratio = float(a.loc[idx_min]) / total_min * 100
+    f_ratio = float(f.loc[idx_min]) / total_min * 100
+
+    st.markdown(
+        f"💡과거 데이터에서 전체 품질비용이 가장 낮았던 관측 시점의 비용 구조는 "
+        f"예방 비용 **{p_ratio:.1f}%**, 평가비용 **{a_ratio:.1f}%**, "
+        f"실패비용 **{f_ratio:.1f}%** 입니다."
+    )
+
+
+
+def build_scenario_result(df, cost_cols, failure_col_name=None, exclude_cols=None):
+    """
+    예방/평가 비용을 변경했을 때 실패비용 변화 시뮬레이션
+    - 실패비용: 사용자가 지정한 통합 실패비용 컬럼 또는 내부/외부 실패비용 합계
+    - 타깃: 실패비용 (회귀) 또는 이진 타깃 (분류)
+    """
+    prevention_cols = cost_cols.get("prevention", [])
+    appraisal_cols = cost_cols.get("appraisal", [])
+    internal_failure_cols = cost_cols.get("internal_failure", [])
+    external_failure_cols = cost_cols.get("external_failure", [])
+
+    df_num = df.select_dtypes(include=[np.number]).copy()
+
+    failure_cols = []
+    if failure_col_name is not None and failure_col_name in df_num.columns:
+        failure_cols = [failure_col_name]
+    else:
+        failure_cols = [c for c in (internal_failure_cols + external_failure_cols) if c in df_num.columns]
+
+    if not failure_cols:
+        return None, "실패비용(타깃) 수치 컬럼을 찾을 수 없습니다. 실패비용 컬럼을 선택해 주세요."
+
+    df_num["failure_cost"] = df_num[failure_cols].sum(axis=1)
+
+    feature_cols = list(set([c for c in prevention_cols + appraisal_cols if c in df_num.columns]))
+    if not feature_cols:
+        feature_cols = [c for c in df_num.columns if c != "failure_cost"]
+
+    data = df_num[feature_cols + ["failure_cost"]].dropna()
+    if data.shape[0] < 20:
+        return None, "시뮬레이션을 하기에는 유효한 데이터가 너무 적습니다."
+
+    X = data[feature_cols]
+    y = data["failure_cost"]
+
+    if exclude_cols:
+        drop_cols = [c for c in exclude_cols if c in X.columns]
+        X = X.drop(columns=drop_cols, errors="ignore")
+
+    failure_related_cols = internal_failure_cols + external_failure_cols
+    if failure_col_name is not None:
+        failure_related_cols.append(failure_col_name)
+    X = remove_failure_related_features(X, failure_related_cols)
+
+    unique_vals = sorted(pd.Series(y).dropna().unique())
+    is_binary = unique_vals in ([0, 1], [0], [1])
+
+    if is_binary:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+        model = XGBClassifier(
+            n_estimators=300,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            eval_metric="logloss"
+        )
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        metric_value = accuracy_score(y_test, y_pred)
+        metric_name = "Accuracy"
+
+        results = {"XGBClassifier": {"model": model, "accuracy": metric_value}}
+        best_model_name = "XGBClassifier"
+
+    else:
+        results, (X_train, X_test, y_train, y_test) = train_models_regression(X, y)
+
+        if "XGBoost" in results:
+            best_model_name = "XGBoost"
+        else:
+            best_model_name = max(results.keys(), key=lambda m: results[m]["r2"])
+
+        model = results[best_model_name]["model"]
+        y_pred = model.predict(X_test)
+        metric_value = r2_score(y_test, y_pred)
+        metric_name = "R2"
+
+    base_point = X.mean(axis=0).to_frame().T
+
+    baseline_prevention = float(base_point[prevention_cols].sum(axis=1).iloc[0]) if prevention_cols else 0.0
+    baseline_appraisal = float(base_point[appraisal_cols].sum(axis=1).iloc[0]) if appraisal_cols else 0.0
+
+    def predict_with_factor(prevention_factor, appraisal_factor):
+        x_new = base_point.copy()
+        for c in prevention_cols:
+            if c in x_new.columns:
+                x_new[c] = x_new[c] * (1 + prevention_factor)
+        for c in appraisal_cols:
+            if c in x_new.columns:
+                x_new[c] = x_new[c] * (1 + appraisal_factor)
+
+        if is_binary:
+            proba = model.predict_proba(x_new)[0][1]
+            return float(proba)
+        else:
+            return float(model.predict(x_new)[0])
+
+    baseline_cost = predict_with_factor(0.0, 0.0)
+
+    return {
+        "model": model,
+        "best_model_name": best_model_name,
+        "feature_cols": feature_cols,
+        "prevention_cols": prevention_cols,
+        "appraisal_cols": appraisal_cols,
+        "baseline_cost": baseline_cost,
+        "baseline_prevention": baseline_prevention,
+        "baseline_appraisal": baseline_appraisal,
+        "predict_func": predict_with_factor,
+        "metrics": results,
+        "task_type": "classification" if is_binary else "regression",
+        "metric_name": metric_name,
+        "metric_value": metric_value,
+    }, None
+
+
+# -----------------------
+# Google Generative AI 챗봇
+# -----------------------
+def generate_ai_response(user_message, api_key, analysis_summary=""):
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+
+    system_prompt = f"""
+    당신은 중소기업의 Q-COST(예방비용, 평가비용, 내부/외부 실패비용) 분석을 도와주는 AI 컨설턴트입니다.
+    회귀분석, 랜덤포레스트, XGBoost, SHAP 결과를 바탕으로 품질 비용 구조와 의사결정을 설명합니다.
+
+    아래는 현재 데이터 분석 요약입니다:
+
+    {analysis_summary}
+
+    이 요약을 참고해서 사용자의 질문에 대해:
+    - 한국어로,
+    - 최대한 쉽게,
+    - 숫자와 직관적 표현을 함께 사용해서
+    설명해 주세요.
+    """
+
+    full_prompt = system_prompt + "\n\n사용자 질문:\n" + user_message
+    response = model.generate_content(full_prompt)
+    return response.text
+
+
+def get_shap_importance_df(model, X_train, feature_names):
+    """
+    SHAP 값을 이용해 각 변수의 평균 |SHAP| (절대값) 중요도를 숫자 테이블로 반환.
+    (UI 수정 금지 파트: 표 렌더링과 연결됨)
+    """
+    sample = X_train
+    if X_train.shape[0] > 500:
+        sample = X_train.sample(500, random_state=42)
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(sample)
+
+    sv = shap_values
+    if isinstance(sv, list):
+        sv = sv[1] if len(sv) > 1 else sv[0]
+
+    sv = np.array(sv)
+    if sv.ndim > 2:
+        n_features = sv.shape[-1]
+        sv = sv.reshape(-1, n_features)
+
+    mean_shap = np.mean(sv, axis=0)
+    mean_abs_shap = np.mean(np.abs(sv), axis=0)
+
+    mean_shap = np.array(mean_shap).ravel()
+    mean_abs_shap = np.array(mean_abs_shap).ravel()
+
+    feature_names = list(feature_names)
+    if len(feature_names) != len(mean_abs_shap):
+        n = min(len(feature_names), len(mean_abs_shap), len(mean_shap))
+        feature_names = feature_names[:n]
+        mean_abs_shap = mean_abs_shap[:n]
+        mean_shap = mean_shap[:n]
+
+    shap_df = pd.DataFrame({
+        "feature": feature_names,
+        "mean_shap": mean_shap,
+        "mean_abs_shap": mean_abs_shap
+    }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    return shap_df
+
+
+def render_shap_table(shap_df):
+    """
+    Streamlit column_config를 활용한 SHAP 표 렌더링 (UI 수정 금지 파트)
+    """
+    df = shap_df.copy()
+
+    total = df["mean_abs_shap"].sum()
+    df["importance_pct"] = df["mean_abs_shap"] / total * 100 if total > 0 else 0.0
+
+    def arrow(v):
+        if v > 0:
+            return "↑ 증가 방향"
+        elif v < 0:
+            return "↓ 감소 방향"
+        return "→ 영향 거의 없음"
+
+    df["direction_arrow"] = df["mean_shap"].apply(arrow)
+
+    show_cols = ["feature", "importance_pct", "direction_arrow", "mean_shap"]
+
+    st.data_editor(
+        df[show_cols],
+        column_config={
+            "feature": st.column_config.TextColumn("변수명"),
+            "importance_pct": st.column_config.ProgressColumn(
+                "중요도 (|SHAP| 기준 비율)",
+                help="각 변수의 |SHAP| 합 대비 비중(%)",
+                format="%.1f",
+                min_value=0.0,
+                max_value=100.0,
+            ),
+            "direction_arrow": st.column_config.TextColumn(
+                "영향 방향",
+                help="↑: 타깃(실패/비용) 증가, ↓: 타깃 감소, →: 거의 영향 없음",
+            ),
+            "mean_shap": st.column_config.NumberColumn(
+                "평균 SHAP 값",
+                help="양수: 타깃 증가 방향, 음수: 타깃 감소 방향",
+                format="%.4f",
+            ),
+        },
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def compute_feature_r2(X, y):
+    """
+    각 입력 변수별로 단순 모델을 돌려 R² 점수를 계산.
+    (UI 수정 금지 파트: 표 렌더링과 연결됨)
+    """
+    rows = []
+    for col in X.columns:
+        if X[col].nunique() < 2:
+            continue
+
+        x_col = X[[col]]
+        model = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=10,
+            min_samples_leaf=3,
+            n_jobs=-1
+        )
+        model.fit(x_col, y)
+        y_pred = model.predict(x_col)
+        r2 = r2_score(y, y_pred)
+
+        rows.append({"feature": col, "R²_single": r2})
+
+    if not rows:
+        return pd.DataFrame(columns=["feature", "R²_single"])
+
+    return pd.DataFrame(rows).sort_values("R²_single", ascending=False).reset_index(drop=True)
+
+
+def render_feature_r2_table(feature_r2_df):
+    """
+    단일 변수별 R² 점수 표 렌더링 (UI 수정 금지 파트)
+    """
+    if feature_r2_df.shape[0] == 0:
+        st.info("각 변수별 R²를 계산할 수 있는 유효한 숫자형 특징이 부족합니다.")
+        return
+
+    df = feature_r2_df.copy()
+    df["R2_for_bar"] = df["R²_single"].clip(lower=0.0)
+
+    show_cols = ["feature", "R2_for_bar", "R²_single"]
+
+    st.data_editor(
+        df[show_cols],
+        column_config={
+            "feature": st.column_config.TextColumn("변수명"),
+            "R2_for_bar": st.column_config.ProgressColumn(
+                "R² (0~1 기준)",
+                help="각 변수 하나만 사용한 모델의 R²를 그대로 0~1 구간에서 막대로 표현합니다.\n"
+                     "음수 R²는 막대가 0으로 표시되고, 실제 값은 오른쪽 숫자에서 확인하세요.",
+                format="%.2f",
+                min_value=0.0,
+                max_value=1.0,
+            ),
+            "R²_single": st.column_config.NumberColumn(
+                "단일 변수 R² (실제 값)",
+                help="각 변수 하나만 사용한 모델의 실제 R² 값입니다. (음수 가능)",
+                format="%.4f",
+            ),
+        },
+        hide_index=True,
+        use_container_width=True,
+    )
