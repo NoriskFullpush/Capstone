@@ -1,2 +1,2 @@
 # Capstone
-AI agents deliver better solutions by measuring enterprise quality costs
+AI agents with streamlit deliver better solutions by measuring enterprise quality costs
