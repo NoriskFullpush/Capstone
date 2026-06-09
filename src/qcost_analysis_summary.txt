@@ -1,0 +1,8 @@
+[회귀 모델 요약]
+- Linear Regression: RMSE=0.000, R²=1.000
+- RandomForest: RMSE=1134.921, R²=0.760
+- XGBoost: RMSE=1100.598, R²=0.774
+- LightGBM: RMSE=2489.519, R²=-0.155
+- CatBoost: RMSE=1108.093, R²=0.771
+- 전체 최고(R²): Linear Regression
+- 타깃: TOTAL_Q_COST, 사용 특징 수: 4
